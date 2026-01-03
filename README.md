@@ -12,6 +12,8 @@ pipeline_tag: text-generation
 
 **Bio-inspired architecture** using iterative integrator dynamics instead of static FFN layers.
 
+*Created by nano3*
+
 ## Quick Start
 
 ```python
@@ -73,7 +75,7 @@ python simple_training.py --streaming --dataset codeparrot --use-amp
 
 ```bibtex
 @misc{inl-llm-2025,
-  author = {Boris Peyriguère},
+  author = {nano3},
   title = {INL-LLM: Integrator Neural Language Model},
   year = {2025}
 }
