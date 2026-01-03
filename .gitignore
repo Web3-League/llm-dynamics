@@ -25,3 +25,8 @@ wandb/
 # HuggingFace cache
 .cache/
 hf_upload/
+
+# Tokenizer files (for GitHub - keep code only)
+merges.txt
+vocab.json
+tokenizer.json
