@@ -1,0 +1,27 @@
+# Checkpoints and models
+checkpoints/
+*.safetensors
+*.pt
+*.bin
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.claude/
+
+# Data files
+*.parquet
+*.json.gz
+
+# Logs
+*.log
+wandb/
+
+# IDE
+.vscode/
+.idea/
+
+# HuggingFace cache
+.cache/
+hf_upload/
