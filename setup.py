@@ -25,7 +25,7 @@ pip install inl-llm
 - Adaptive early stopping (+50% speed)
 """,
     long_description_content_type="text/markdown",
-    url="https://huggingface.co/Pacific-Prime/pacific-prime",
+    url="https://github.com/Web3-League/llm-dynamics",
     packages=find_packages(),
     python_requires=">=3.8",
     install_requires=[
