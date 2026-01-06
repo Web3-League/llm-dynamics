@@ -1,80 +1,55 @@
 #!/usr/bin/env python3
-"""
-Convert PyTorch checkpoint to SafeTensors format for HuggingFace upload.
-
-Usage:
-    python convert_to_safetensors.py checkpoints/final_model/pytorch_model.pt output/
-"""
-
+"""Convert .pt checkpoint to safetensors format."""
 import torch
-import argparse
-import os
-import json
-import shutil
 from safetensors.torch import save_file
+import os
 
-def convert_checkpoint(input_path: str, output_dir: str):
-    """Convert .pt checkpoint to .safetensors format."""
+def convert_checkpoint(pt_path, output_path=None):
+    """Convert a .pt checkpoint to safetensors."""
+    print(f"Loading checkpoint: {pt_path}")
 
-    os.makedirs(output_dir, exist_ok=True)
+    # Load checkpoint
+    ckpt = torch.load(pt_path, map_location='cpu')
 
-    print(f"Loading checkpoint from {input_path}...")
-    checkpoint = torch.load(input_path, map_location='cpu')
-
-    # Handle different checkpoint formats
-    if 'model_state_dict' in checkpoint:
-        state_dict = checkpoint['model_state_dict']
-    elif 'state_dict' in checkpoint:
-        state_dict = checkpoint['state_dict']
+    # Extract model state dict
+    if 'model_state_dict' in ckpt:
+        state_dict = ckpt['model_state_dict']
+        step = ckpt.get('global_step', 'unknown')
+        print(f"Checkpoint from step: {step}")
     else:
-        state_dict = checkpoint
+        state_dict = ckpt
+        step = 'unknown'
 
-    # Remove 'module.' prefix if present (from DDP training)
-    cleaned_state_dict = {}
-    for key, value in state_dict.items():
-        new_key = key.replace('module.', '')
-        # SafeTensors requires contiguous tensors
-        if isinstance(value, torch.Tensor):
-            cleaned_state_dict[new_key] = value.contiguous()
+    # Count parameters
+    total_params = sum(p.numel() for p in state_dict.values())
+    print(f"Total parameters: {total_params:,}")
 
-    print(f"Found {len(cleaned_state_dict)} tensors")
+    # Clone all tensors to break shared memory (required for safetensors)
+    print("Cloning tensors to break shared memory...")
+    state_dict = {k: v.clone().contiguous() for k, v in state_dict.items()}
+
+    # Output path
+    if output_path is None:
+        output_path = pt_path.replace('.pt', '.safetensors')
 
     # Save as safetensors
-    output_path = os.path.join(output_dir, 'model.safetensors')
-    print(f"Saving to {output_path}...")
-    save_file(cleaned_state_dict, output_path)
+    print(f"Saving to: {output_path}")
+    save_file(state_dict, output_path)
 
-    # Copy config and tokenizer files if they exist
-    input_dir = os.path.dirname(input_path)
-    files_to_copy = [
-        'config.json',
-        'tokenizer.json',
-        'tokenizer_config.json',
-        'vocab.json',
-        'merges.txt',
-        'special_tokens_map.json',
-        'added_tokens.json',
-        'generation_config.json'
-    ]
+    # Compare file sizes
+    pt_size = os.path.getsize(pt_path) / (1024**3)
+    st_size = os.path.getsize(output_path) / (1024**3)
+    print(f"Original .pt: {pt_size:.2f} GB")
+    print(f"Safetensors:  {st_size:.2f} GB")
+    print("Done!")
 
-    for fname in files_to_copy:
-        src = os.path.join(input_dir, fname)
-        if os.path.exists(src):
-            shutil.copy(src, os.path.join(output_dir, fname))
-            print(f"  Copied {fname}")
+    return output_path
 
-    # Calculate size
-    size_mb = os.path.getsize(output_path) / (1024 * 1024)
-    print(f"\n✅ Conversion complete!")
-    print(f"   Output: {output_path}")
-    print(f"   Size: {size_mb:.1f} MB")
-    print(f"\nTo upload to HuggingFace:")
-    print(f"   huggingface-cli upload Pacific-Prime/pacific-prime {output_dir}/")
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) > 1:
+        pt_path = sys.argv[1]
+    else:
+        pt_path = "checkpoints/checkpoint-step-230000.pt"
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Convert PyTorch checkpoint to SafeTensors')
-    parser.add_argument('input', help='Path to .pt checkpoint file')
-    parser.add_argument('output', help='Output directory')
-    args = parser.parse_args()
-
-    convert_checkpoint(args.input, args.output)
+    convert_checkpoint(pt_path)

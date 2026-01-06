@@ -41,9 +41,9 @@ import time
 from pathlib import Path
 
 # Import from the correct path
-from inl_llm.models.integrator_language_model import UltraOptimizedIntegratorLanguageModel
-from inl_llm.core.integrator_losses import IntegratorLoss
-from inl_llm.core.integrator_scheduler_v2 import create_cycle_scheduler
+from inl_llm_v3.models.integrator_language_model import UltraOptimizedIntegratorLanguageModel
+from inl_llm_v3.core.integrator_losses import IntegratorLoss
+from inl_llm_v3.core.integrator_scheduler_v2 import create_cycle_scheduler
 
 # Distributed training imports
 try:

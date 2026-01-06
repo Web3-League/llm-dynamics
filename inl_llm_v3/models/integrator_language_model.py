@@ -24,6 +24,116 @@ import torch.nn.functional as F
 from typing import Optional, Tuple, Dict, List
 import math
 
+# ============================================================================
+# MODERN OPTIMIZATIONS (v3)
+# ============================================================================
+
+class RMSNorm(nn.Module):
+    """
+    Root Mean Square Layer Normalization (RMSNorm)
+
+    Faster than LayerNorm: no mean computation, no bias.
+    Used in LLaMA, Mistral, etc.
+
+    RMSNorm(x) = x * rsqrt(mean(x²) + eps) * weight
+    """
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [batch, seq_len, dim]
+        rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return x * rms * self.weight
+
+
+class RotaryPositionalEmbedding(nn.Module):
+    """
+    Rotary Position Embedding (RoPE)
+
+    Encodes position in the rotation of query/key vectors.
+    Better extrapolation than absolute positional encodings.
+    Used in LLaMA, GPT-NeoX, etc.
+    """
+    def __init__(self, dim: int, max_seq_len: int = 4096, base: float = 10000.0):
+        super().__init__()
+        self.dim = dim
+        self.max_seq_len = max_seq_len
+        self.base = base
+
+        # Precompute inverse frequencies
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer('inv_freq', inv_freq)
+
+        # Precompute cos/sin for efficiency
+        self._precompute_cos_sin(max_seq_len)
+
+    def _precompute_cos_sin(self, seq_len: int):
+        """Precompute cos and sin for all positions."""
+        t = torch.arange(seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
+        freqs = torch.outer(t, self.inv_freq)  # [seq_len, dim/2]
+        # Duplicate for pairs: [seq_len, dim]
+        emb = torch.cat([freqs, freqs], dim=-1)
+        self.register_buffer('cos_cached', emb.cos().unsqueeze(0).unsqueeze(0))  # [1, 1, seq_len, dim]
+        self.register_buffer('sin_cached', emb.sin().unsqueeze(0).unsqueeze(0))  # [1, 1, seq_len, dim]
+
+    def _rotate_half(self, x: torch.Tensor) -> torch.Tensor:
+        """Rotate half of the dimensions."""
+        x1 = x[..., :x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2:]
+        return torch.cat([-x2, x1], dim=-1)
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, start_pos: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Apply rotary embeddings to query and key.
+
+        Args:
+            q: Query tensor [batch, num_heads, seq_len, head_dim]
+            k: Key tensor [batch, num_heads, seq_len, head_dim]
+            start_pos: Starting position (for KV cache)
+
+        Returns:
+            Rotated q, k tensors
+        """
+        seq_len = q.shape[2]
+
+        # Extend cache if needed
+        if start_pos + seq_len > self.cos_cached.shape[2]:
+            self._precompute_cos_sin(start_pos + seq_len)
+
+        cos = self.cos_cached[:, :, start_pos:start_pos + seq_len, :q.shape[-1]]
+        sin = self.sin_cached[:, :, start_pos:start_pos + seq_len, :q.shape[-1]]
+
+        # Apply rotation
+        q_embed = (q * cos) + (self._rotate_half(q) * sin)
+        k_embed = (k * cos) + (self._rotate_half(k) * sin)
+
+        return q_embed, k_embed
+
+
+class SwiGLU(nn.Module):
+    """
+    SwiGLU Activation (Swish-Gated Linear Unit)
+
+    Better than GELU for language models.
+    Used in LLaMA, PaLM, etc.
+
+    SwiGLU(x, W, V, W2) = (Swish(xW) ⊙ xV)W2
+    """
+    def __init__(self, in_features: int, hidden_features: int, out_features: int, dropout: float = 0.0):
+        super().__init__()
+        # SwiGLU has 3 projections instead of 2
+        # To match param count with FFN(4*d), use hidden = 2/3 * 4 * d = 8/3 * d
+        self.w1 = nn.Linear(in_features, hidden_features, bias=False)  # Gate projection
+        self.w2 = nn.Linear(hidden_features, out_features, bias=False)  # Down projection
+        self.w3 = nn.Linear(in_features, hidden_features, bias=False)  # Up projection
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # SwiGLU: (swish(x @ W1) * (x @ W3)) @ W2
+        return self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
+
 from ..optimizations.optimizations import (
     LowRankEmbedding,
     GradientCheckpointedINL,
@@ -164,20 +274,26 @@ class INLCache:
         return cache
 
 
-class INLCachedAttention(nn.Module):
+class GroupedQueryAttention(nn.Module):
     """
-    Multi-head self-attention with KV cache support.
+    Grouped Query Attention (GQA) with RoPE and KV cache support.
 
-    Replaces nn.MultiheadAttention with a cache-aware implementation.
-    Compatible with INL-LLM's architecture and optimizations.
+    GQA reduces memory usage by using fewer KV heads than Q heads.
+    - MHA: num_kv_heads = num_heads (full)
+    - MQA: num_kv_heads = 1 (minimal)
+    - GQA: 1 < num_kv_heads < num_heads (balanced)
+
+    Used in LLaMA 2, Mistral, etc.
     """
 
     def __init__(
         self,
         embed_dim: int,
         num_heads: int,
+        num_kv_heads: Optional[int] = None,  # If None, defaults to num_heads (MHA)
         dropout: float = 0.0,
-        bias: bool = True
+        max_seq_len: int = 4096,
+        rope_base: float = 10000.0
     ):
         super().__init__()
 
@@ -186,14 +302,19 @@ class INLCachedAttention(nn.Module):
 
         self.embed_dim = embed_dim
         self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.head_dim = embed_dim // num_heads
+        self.num_kv_groups = num_heads // self.num_kv_heads  # How many Q heads per KV head
         self.dropout = dropout
 
-        # Combined QKV projection (more efficient)
-        self.qkv_proj = nn.Linear(embed_dim, 3 * embed_dim, bias=bias)
+        # Separate Q, K, V projections (no bias, like LLaMA)
+        self.q_proj = nn.Linear(embed_dim, num_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(embed_dim, self.num_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(embed_dim, self.num_kv_heads * self.head_dim, bias=False)
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=False)
 
-        # Output projection
-        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        # RoPE
+        self.rope = RotaryPositionalEmbedding(self.head_dim, max_seq_len, rope_base)
 
         self.attn_dropout = nn.Dropout(dropout)
         self.resid_dropout = nn.Dropout(dropout)
@@ -202,79 +323,101 @@ class INLCachedAttention(nn.Module):
         self._reset_parameters()
 
     def _reset_parameters(self):
-        """Initialize parameters like nn.MultiheadAttention."""
-        nn.init.xavier_uniform_(self.qkv_proj.weight)
-        if self.qkv_proj.bias is not None:
-            nn.init.constant_(self.qkv_proj.bias, 0.0)
-
+        """Initialize parameters."""
+        nn.init.xavier_uniform_(self.q_proj.weight)
+        nn.init.xavier_uniform_(self.k_proj.weight)
+        nn.init.xavier_uniform_(self.v_proj.weight)
         nn.init.xavier_uniform_(self.out_proj.weight)
-        if self.out_proj.bias is not None:
-            nn.init.constant_(self.out_proj.bias, 0.0)
+
+    def _repeat_kv(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Repeat KV heads to match Q heads.
+
+        Args:
+            x: [batch, num_kv_heads, seq_len, head_dim]
+
+        Returns:
+            [batch, num_heads, seq_len, head_dim]
+        """
+        if self.num_kv_groups == 1:
+            return x
+
+        batch, num_kv_heads, seq_len, head_dim = x.shape
+        # [B, num_kv_heads, 1, S, D] -> [B, num_kv_heads, num_kv_groups, S, D]
+        x = x.unsqueeze(2).expand(batch, num_kv_heads, self.num_kv_groups, seq_len, head_dim)
+        return x.reshape(batch, self.num_heads, seq_len, head_dim)
 
     def forward(
         self,
         x: torch.Tensor,
         attn_mask: Optional[torch.Tensor] = None,
         cache_layer: Optional[INLCacheLayer] = None,
-        use_cache: bool = False
+        use_cache: bool = False,
+        start_pos: int = 0
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         """
-        Forward pass with optional KV caching.
+        Forward pass with GQA, RoPE, and optional KV caching.
 
         Args:
             x: Input tensor [batch_size, seq_len, embed_dim]
             attn_mask: Attention mask [seq_len, seq_len] or [tgt_len, src_len]
             cache_layer: Cache layer to update (if using cache)
             use_cache: Whether to use/update cache
+            start_pos: Starting position for RoPE (for KV cache)
 
         Returns:
             attn_output: [batch_size, seq_len, embed_dim]
             new_cache: Updated (keys, values) if use_cache else None
         """
-        batch_size, seq_len, embed_dim = x.shape
+        batch_size, seq_len, _ = x.shape
 
-        # Compute Q, K, V
-        qkv = self.qkv_proj(x)  # [B, S, 3*D]
-        qkv = qkv.reshape(batch_size, seq_len, 3, self.num_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)  # [3, B, num_heads, S, head_dim]
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        # Project Q, K, V separately
+        q = self.q_proj(x)  # [B, S, num_heads * head_dim]
+        k = self.k_proj(x)  # [B, S, num_kv_heads * head_dim]
+        v = self.v_proj(x)  # [B, S, num_kv_heads * head_dim]
+
+        # Reshape to [B, num_heads/num_kv_heads, S, head_dim]
+        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        # Apply RoPE to Q and K
+        q, k = self.rope(q, k, start_pos=start_pos)
 
         # Handle cache
         if use_cache and cache_layer is not None:
-            # Update cache with new K, V
             k, v = cache_layer.update_attention(k, v)
 
-        # Compute attention scores
-        # q: [B, num_heads, tgt_len, head_dim]
-        # k: [B, num_heads, src_len, head_dim]
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        # attn_weights: [B, num_heads, tgt_len, src_len]
+        # Repeat KV heads to match Q heads
+        k = self._repeat_kv(k)  # [B, num_heads, src_len, head_dim]
+        v = self._repeat_kv(v)  # [B, num_heads, src_len, head_dim]
 
-        # Apply attention mask (causal mask for autoregressive generation)
+        # Scaled dot-product attention
+        scale = 1.0 / math.sqrt(self.head_dim)
+        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
+
+        # Apply attention mask
         if attn_mask is not None:
-            # attn_mask is [tgt_len, src_len] boolean mask (True = masked position)
-            # Expand for batch and heads
-            attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, tgt_len, src_len]
+            attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)
             attn_weights = attn_weights.masked_fill(attn_mask, float('-inf'))
 
-        # Softmax
         attn_weights = F.softmax(attn_weights, dim=-1)
         attn_weights = self.attn_dropout(attn_weights)
 
         # Apply attention to values
-        # v: [B, num_heads, src_len, head_dim]
-        attn_output = torch.matmul(attn_weights, v)  # [B, num_heads, tgt_len, head_dim]
+        attn_output = torch.matmul(attn_weights, v)
 
         # Reshape and project
-        attn_output = attn_output.transpose(1, 2)  # [B, tgt_len, num_heads, head_dim]
-        attn_output = attn_output.reshape(batch_size, seq_len, embed_dim)
+        attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, self.embed_dim)
         attn_output = self.out_proj(attn_output)
         attn_output = self.resid_dropout(attn_output)
 
-        # Return cache if requested
         cache_output = (k, v) if use_cache else None
-
         return attn_output, cache_output
+
+
+# Keep old class as alias for backward compatibility
+INLCachedAttention = GroupedQueryAttention
 
 
 class PositionalEncoding(nn.Module):
@@ -305,9 +448,12 @@ class PositionalEncoding(nn.Module):
 
 class UltraOptimizedINLBlock(nn.Module):
     """
-    Ultra-optimized INL block with all optimizations enabled.
+    Ultra-optimized INL block with all optimizations enabled (v3).
 
     Uses:
+    - RMSNorm (faster than LayerNorm)
+    - GQA + RoPE (better attention + position encoding)
+    - SwiGLU (better activation)
     - Shared controllers (across all blocks in the model)
     - Hierarchical equilibrium
     - Sparse harmonic excitation
@@ -329,7 +475,11 @@ class UltraOptimizedINLBlock(nn.Module):
         adaptive_convergence_threshold: float = 0.001,
         group_size: int = 64,
         excitation_sparsity: float = 0.1,
-        budget_allocator: Optional[AdaptiveBudgetAllocator] = None
+        budget_allocator: Optional[AdaptiveBudgetAllocator] = None,
+        # v3 optimizations
+        num_kv_heads: Optional[int] = None,  # GQA: fewer KV heads
+        max_seq_len: int = 4096,
+        rope_base: float = 10000.0
     ):
         super().__init__()
 
@@ -340,16 +490,19 @@ class UltraOptimizedINLBlock(nn.Module):
         self.use_adaptive_stopping = use_adaptive_stopping
         self.budget_allocator = budget_allocator
 
-        # Norms
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.norm_attn = nn.LayerNorm(d_model)
+        # v3: RMSNorm instead of LayerNorm
+        self.norm1 = RMSNorm(d_model)
+        self.norm2 = RMSNorm(d_model)
+        self.norm_attn = RMSNorm(d_model)
 
-        # Attention with KV cache support
-        self.attention = INLCachedAttention(
+        # v3: GQA + RoPE instead of standard MHA
+        self.attention = GroupedQueryAttention(
             embed_dim=d_model,
             num_heads=num_heads,
-            dropout=dropout
+            num_kv_heads=num_kv_heads,  # GQA
+            dropout=dropout,
+            max_seq_len=max_seq_len,
+            rope_base=rope_base
         )
 
         # Ultra-optimized INL
@@ -374,13 +527,14 @@ class UltraOptimizedINLBlock(nn.Module):
         else:
             self.inl = base_inl
 
-        # Feedforward
-        self.ff = nn.Sequential(
-            nn.Linear(d_model, feedforward_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(feedforward_dim, d_model),
-            nn.Dropout(dropout)
+        # v3: SwiGLU instead of GELU FFN
+        # SwiGLU hidden dim is typically 8/3 * d_model to match param count
+        swiglu_hidden = int(feedforward_dim * 2 / 3)  # Adjust for 3 matrices
+        self.ff = SwiGLU(
+            in_features=d_model,
+            hidden_features=swiglu_hidden,
+            out_features=d_model,
+            dropout=dropout
         )
 
         self.dropout = nn.Dropout(dropout)
@@ -390,11 +544,12 @@ class UltraOptimizedINLBlock(nn.Module):
         x: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
         cache_layer: Optional[INLCacheLayer] = None,
-        use_cache: bool = False
+        use_cache: bool = False,
+        start_pos: int = 0  # v3: for RoPE position encoding
     ) -> Tuple[torch.Tensor, Dict]:
         batch_size, seq_len, d_model = x.shape
 
-        # Step 1: Attention with KV cache
+        # Step 1: Attention with KV cache and RoPE
         x_norm = self.norm_attn(x)
 
         # Build causal mask
@@ -420,7 +575,8 @@ class UltraOptimizedINLBlock(nn.Module):
         else:
             attn_mask = mask
 
-        attn_output, _ = self.attention(x_norm, attn_mask=attn_mask, cache_layer=cache_layer, use_cache=use_cache)
+        # v3: Pass start_pos to attention for RoPE
+        attn_output, _ = self.attention(x_norm, attn_mask=attn_mask, cache_layer=cache_layer, use_cache=use_cache, start_pos=start_pos)
         x = x + self.dropout(attn_output)
         context = attn_output
 
@@ -553,9 +709,13 @@ class UltraOptimizedINLBlock(nn.Module):
 
 class UltraOptimizedIntegratorLanguageModel(nn.Module):
     """
-    ULTRA-OPTIMIZED INL-LLM
+    ULTRA-OPTIMIZED INL-LLM v3
 
     All optimizations enabled by default:
+    ✅ RMSNorm (faster than LayerNorm)
+    ✅ RoPE (better position encoding)
+    ✅ GQA (memory-efficient attention)
+    ✅ SwiGLU (better activation)
     ✅ Low-rank embeddings (87% reduction)
     ✅ Gradient checkpointing (60% memory save)
     ✅ Adaptive early stopping (40% faster)
@@ -576,6 +736,9 @@ class UltraOptimizedIntegratorLanguageModel(nn.Module):
         feedforward_dim: int = None,
         max_seq_len: int = 2048,
         dropout: float = 0.1,
+        # v3: GQA parameters
+        num_kv_heads: Optional[int] = None,  # GQA: fewer KV heads (None = MHA)
+        rope_base: float = 10000.0,
         # Optimization flags
         use_lowrank_embeddings: bool = True,
         lowrank_ratio: float = 0.125,
@@ -595,7 +758,9 @@ class UltraOptimizedIntegratorLanguageModel(nn.Module):
         self.vocab_size = vocab_size
         self.d_model = d_model
         self.num_layers = num_layers
+        self.max_seq_len = max_seq_len
         self.use_adaptive_budget = use_adaptive_budget
+        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
 
         if feedforward_dim is None:
             feedforward_dim = 4 * d_model
@@ -607,8 +772,8 @@ class UltraOptimizedIntegratorLanguageModel(nn.Module):
         else:
             self.token_embedding = nn.Embedding(vocab_size, d_model)
 
-        # Positional encoding
-        self.pos_encoding = PositionalEncoding(d_model, max_seq_len)
+        # v3: No positional encoding needed - RoPE is applied in attention
+        # (Removed: self.pos_encoding = PositionalEncoding(d_model, max_seq_len))
         self.dropout = nn.Dropout(dropout)
 
         # Shared controller (ONE for all layers!)
@@ -623,7 +788,7 @@ class UltraOptimizedIntegratorLanguageModel(nn.Module):
         else:
             self.shared_controller = None
 
-        # Adaptive budget allocator (NEW!)
+        # Adaptive budget allocator
         if use_adaptive_budget:
             self.budget_allocator = create_budget_allocator(
                 num_layers=num_layers,
@@ -637,7 +802,7 @@ class UltraOptimizedIntegratorLanguageModel(nn.Module):
         else:
             self.budget_allocator = None
 
-        # Layers
+        # v3: Layers with GQA + RoPE + SwiGLU + RMSNorm
         self.layers = nn.ModuleList([
             UltraOptimizedINLBlock(
                 d_model=d_model,
@@ -652,15 +817,19 @@ class UltraOptimizedIntegratorLanguageModel(nn.Module):
                 adaptive_convergence_threshold=adaptive_convergence_threshold,
                 group_size=hierarchical_group_size,
                 excitation_sparsity=excitation_sparsity,
-                budget_allocator=self.budget_allocator
+                budget_allocator=self.budget_allocator,
+                # v3 parameters
+                num_kv_heads=num_kv_heads,
+                max_seq_len=max_seq_len,
+                rope_base=rope_base
             )
             for i in range(num_layers)
         ])
 
-        # Final norm
-        self.final_norm = nn.LayerNorm(d_model)
+        # v3: RMSNorm instead of LayerNorm
+        self.final_norm = RMSNorm(d_model)
 
-        # LM head
+        # LM head (no bias, like LLaMA)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
 
         # Initialize
@@ -679,9 +848,14 @@ class UltraOptimizedIntegratorLanguageModel(nn.Module):
     def _print_optimization_status(self):
         """Print optimization summary."""
         print("\n" + "=" * 70)
-        print("ULTRA-OPTIMIZED INL-LLM")
+        print("ULTRA-OPTIMIZED INL-LLM v3")
         print("=" * 70)
-        print("LEVEL 1 (Basic Optimizations):")
+        print("v3 Modern Optimizations:")
+        print(f"  ✅ RMSNorm (faster normalization)")
+        print(f"  ✅ RoPE (rotary position embeddings)")
+        print(f"  ✅ GQA (grouped-query attention, {self.num_kv_heads} KV heads)")
+        print(f"  ✅ SwiGLU (swish-gated activation)")
+        print("\nLEVEL 1 (Basic Optimizations):")
         print(f"  ✅ Low-rank embeddings")
         print(f"  ✅ Gradient checkpointing")
         print(f"  ✅ Adaptive early stopping")
@@ -725,14 +899,13 @@ class UltraOptimizedIntegratorLanguageModel(nn.Module):
         if use_cache and past_key_values is None:
             past_key_values = INLCache(num_layers=self.num_layers)
 
-        # Determine starting position for positional encoding
+        # v3: Determine starting position for RoPE (applied in attention)
         start_pos = 0
         if use_cache and past_key_values is not None:
             start_pos = past_key_values.get_seq_length()
 
-        # Embedding with correct positional encoding
+        # v3: Token embedding only (RoPE applied in attention, not here)
         x = self.token_embedding(input_ids)
-        x = self.pos_encoding(x, start_pos=start_pos)
         x = self.dropout(x)
 
         # Layers
@@ -740,11 +913,12 @@ class UltraOptimizedIntegratorLanguageModel(nn.Module):
 
         for layer_idx, layer in enumerate(self.layers):
             cache_layer = past_key_values[layer_idx] if use_cache else None
-            x, aux = layer(x, mask=attention_mask, cache_layer=cache_layer, use_cache=use_cache)
+            # v3: Pass start_pos to layer for RoPE
+            x, aux = layer(x, mask=attention_mask, cache_layer=cache_layer, use_cache=use_cache, start_pos=start_pos)
             if return_aux:
                 all_aux.append(aux)
 
-        # Final norm
+        # Final norm (v3: RMSNorm)
         x = self.final_norm(x)
 
         # LM head
