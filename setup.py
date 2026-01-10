@@ -2,8 +2,8 @@
 from setuptools import setup, find_packages
 
 setup(
-    name="inl-llm",
-    version="3.1.0",
+    name="llm-dynamics",
+    version="1.0.0",
     author="nano3",
     author_email="",
     description="INL-LLM: Integrator Neuron Language Model with bio-inspired dynamics",
